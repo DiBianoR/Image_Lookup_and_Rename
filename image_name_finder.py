@@ -20,7 +20,6 @@ RENAME_FILES = True  # Set to False to keep original filenames
 
 # --- DEBUG FLAG ---
 # Set to True to save the raw SerpApi response to a '_tmp.json' file.
-# Useful for debugging or if you want the script to cache the network call.
 SAVE_RAW_LENS_DATA = True
 
 # Initialize the Gemini client
@@ -153,18 +152,18 @@ def search_google_lens(image_url: str) -> dict:
     return response.json()
 
 
-def analyze_json_with_gemini(lens_json_data: dict) -> str:
+def analyze_json_with_gemini(lens_json_data: dict, model_name: str = "gemini-2.5-flash-lite", temp: float = 0.0) -> str:
     """Passes the raw Lens JSON to Gemini for structured extraction."""
     prompt = f"```json\n{json.dumps(lens_json_data)}\n```\n"
     prompt += "Using only this json, without looking online or at any other sources, can you definitively say what the title of the image in question is?"
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash-lite",
+        model=model_name,
         contents=prompt,
         config={
             "response_mime_type": "application/json",
             "response_json_schema": GEMINI_SCHEMA,
-            "temperature": 0.0
+            "temperature": temp
         },
     )
     return response.text
@@ -257,14 +256,25 @@ def main():
                     print(f"[*] Saved raw Lens data to: {raw_lens_filepath.name}")
 
             # 2. Pass the data to Gemini for extraction
-            print("[*] Passing data to Gemini for analysis...")
-            gemini_output = analyze_json_with_gemini(lens_data)
+            print("[*] Passing data to Gemini for analysis (Pass 1: flash-lite)...")
+            gemini_output = analyze_json_with_gemini(lens_data, model_name="gemini-2.5-flash-lite", temp=0.0)
             parsed_metadata = json.loads(gemini_output)
 
-            # 3. Dedicated Fallback logic
+            # Evaluate First Pass
             title_val = parsed_metadata.get("title_of_work")
             title_found = parsed_metadata.get("title_found") and title_val
 
+            # 2b. Second Pass if Title not found
+            if not title_found:
+                print("[*] Title not found definitively. Retrying (Pass 2: flash, temp 0.1)...")
+                gemini_output_pass2 = analyze_json_with_gemini(lens_data, model_name="gemini-2.5-flash", temp=0.1)
+                parsed_metadata = json.loads(gemini_output_pass2)
+
+                # Re-evaluate
+                title_val = parsed_metadata.get("title_of_work")
+                title_found = parsed_metadata.get("title_found") and title_val
+
+            # 3. Dedicated Fallback logic
             if title_found:
                 if parsed_metadata.get("artist_name") is None:
                     print(f"[*] Missing artist for '{title_val}'. Triggering dedicated search...")
@@ -297,7 +307,7 @@ def main():
             # SMART NAMING LOGIC: Adjust strings based on what data actually exists
             if title_found:
                 artist_str = artist_val or "Artist unknown"
-                year_str = f" ({year_val})" if year_val else " (?)"
+                year_str = f" ({year_val})" if year_val else ""
                 raw_new_name = f"{artist_str} - {title_val}{year_str}"
 
                 # Clean strings for console output
