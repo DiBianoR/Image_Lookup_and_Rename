@@ -3,17 +3,18 @@ import requests
 import json
 import urllib.parse
 import re
+import time
 from pathlib import Path
 from google import genai
 
 # ==========================================
 # Configuration
 # ==========================================
-SERPAPI_KEY = os.getenv("SERPAPI_KEY", "?????")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "?????")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY", "????")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "????")
 
-DIRECTORY_PATH = r"\\?????\Abyss Web Server\htdocs\tmp"
-BASE_URL = "https://?????/tmp/"
+DIRECTORY_PATH = r"\\????\Abyss Web Server\htdocs\tmp"
+BASE_URL = "https://????/tmp/"
 
 # --- PROCESSING SWITCHES ---
 RENAME_FILES = True  # Set to False to keep original filenames
@@ -146,6 +147,20 @@ def get_unique_base_name(directory: Path, desired_base: str, original_filepath: 
         counter += 1
 
 
+def scrub_lens_data(data: dict) -> bool:
+    """
+    Removes search_metadata and search_parameters from the SerpApi JSON.
+    This prevents 'data leakage' where the LLM sees the original filename via the query URL.
+    Returns True if the data was modified.
+    """
+    modified = False
+    for key in ["search_metadata", "search_parameters"]:
+        if key in data:
+            del data[key]
+            modified = True
+    return modified
+
+
 def search_google_lens(image_url: str) -> dict:
     """Calls SerpApi Google Lens endpoint with explicit configuration."""
     params = {
@@ -168,8 +183,8 @@ def search_google_lens(image_url: str) -> dict:
 
 def fetch_full_ai_overview(ai_overview_dict: dict, error_list: list, filename: str) -> dict:
     """
-    Takes the lazily-loaded ai_overview dict, uses the page_token to fetch the full text,
-    and returns the populated dictionary. Replaces with {} on failure.
+    Takes the lazily-loaded ai_overview dict, uses the page_token to fetch the full text.
+    Retries up to 3 times if Google returns an empty object.
     """
     page_token = ai_overview_dict.get("page_token")
     if not page_token:
@@ -182,23 +197,35 @@ def fetch_full_ai_overview(ai_overview_dict: dict, error_list: list, filename: s
         "api_key": SERPAPI_KEY
     }
 
-    try:
-        response = requests.get("https://serpapi.com/search", params=params)
-        response.raise_for_status()
-        new_data = response.json()
-        print("    [+] Successfully retrieved full AI Overview.")
-        return new_data.get("ai_overview", {})
-    except Exception as e:
-        err_msg = f"Failed to fetch AI Overview for {filename}: {e}"
-        print(f"    [!] {err_msg}")
-        error_list.append(err_msg)
-        return {}  # Wipe the token out since it's useless now
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.get("https://serpapi.com/search", params=params)
+            response.raise_for_status()
+            new_data = response.json()
+            fetched_overview = new_data.get("ai_overview", {})
+
+            if fetched_overview:
+                print("    [+] Successfully retrieved full AI Overview.")
+                return fetched_overview
+            else:
+                print(f"    [-] Attempt {attempt + 1}: AI Overview returned empty. Retrying...")
+                time.sleep(3)
+
+        except Exception as e:
+            print(f"    [-] Attempt {attempt + 1} failed: {e}")
+            time.sleep(3)
+
+    err_msg = f"Failed to fetch AI Overview for {filename} after {max_retries} attempts."
+    print(f"    [!] {err_msg}")
+    error_list.append(err_msg)
+    return {}  # Wipe the token out since it failed
 
 
 def analyze_json_with_gemini(lens_json_data: dict, model_name: str = "gemini-2.5-flash-lite", temp: float = 0.0) -> str:
     """Passes the raw Lens JSON to Gemini for structured extraction."""
     prompt = f"```json\n{json.dumps(lens_json_data)}\n```\n"
-    prompt += "Using only this json, without looking online or at any other sources, can you definitively say what the title of the image in question is?"
+    prompt += "Using only this json, without looking online or at any other sources, can you definitively say what the title of the image in question is? Titles from Arthive are not reliable."
 
     response = client.models.generate_content(
         model=model_name,
@@ -266,6 +293,7 @@ def main():
 
     # Track non-fatal errors to report at the end
     run_errors = []
+    skipped_files = []
 
     if not image_dir.exists():
         print(f"[!] Cannot find the directory: {DIRECTORY_PATH}")
@@ -286,6 +314,7 @@ def main():
         if metadata_filepath.exists() and not REDO_LLM:
             print(f"[*] Found existing metadata: {metadata_filepath.name}")
             print("    Skipping. (Set REDO_LLM=True to reprocess local data).")
+            skipped_files.append(filepath.name)
             continue
 
         try:
@@ -296,15 +325,25 @@ def main():
                 with open(raw_lens_filepath, "r", encoding="utf-8") as f:
                     lens_data = json.load(f)
 
-                # If a local cache contains a page_token, it is certainly expired (> 1 minute).
-                if "ai_overview" in lens_data and "page_token" in lens_data["ai_overview"]:
-                    warn_msg = f"Local cache contained an expired AI Overview token for {filepath.name}. Discarding cache and re-fetching SerpApi."
+                # Scrub existing cache to prevent filename data leakage
+                cache_modified = scrub_lens_data(lens_data)
+
+                # If a local cache contains a page_token, OR if the ai_overview is literally {}, it is expired/failed.
+                if "ai_overview" in lens_data and (
+                        not lens_data["ai_overview"] or "page_token" in lens_data["ai_overview"]):
+                    warn_msg = f"Local cache contained an expired or empty AI Overview for {filepath.name}. Discarding cache and re-fetching SerpApi."
                     print(f"    [!] {warn_msg}")
                     run_errors.append(warn_msg)
-                    raw_lens_filepath.unlink()  # Delete the expired cache file
+                    raw_lens_filepath.unlink()  # Delete the expired/failed cache file
                 else:
                     print(f"[*] Found existing raw data: {raw_lens_filepath.name} (Skipping SerpApi)")
                     needs_serpapi_fetch = False
+
+                    # If we modified the cache by scrubbing out the URLs, save it so it's clean for future runs
+                    if cache_modified and SAVE_RAW_LENS_DATA:
+                        with open(raw_lens_filepath, "w", encoding="utf-8") as f:
+                            json.dump(lens_data, f, indent=4)
+                        print("    [*] Scrubbed original filename leak from existing local cache.")
 
             if needs_serpapi_fetch:
                 safe_filename = urllib.parse.quote(filepath.name)
@@ -313,6 +352,9 @@ def main():
                 print("[*] Querying SerpApi Google Lens...")
 
                 lens_data = search_google_lens(public_url)
+
+                # Scrub the fresh data before anything else sees it
+                scrub_lens_data(lens_data)
 
                 # Intercept and fetch the full AI Overview immediately before it expires
                 if "ai_overview" in lens_data:
@@ -323,6 +365,9 @@ def main():
                     with open(raw_lens_filepath, "w", encoding="utf-8") as json_file:
                         json.dump(lens_data, json_file, indent=4)
                     print(f"[*] Saved raw Lens data to: {raw_lens_filepath.name}")
+
+            # Assess if the AI Overview was completely empty or failed
+            missing_ai_overview = not bool(lens_data.get("ai_overview"))
 
             # 2. Pass the data to Gemini for extraction
             print("[*] Passing data to Gemini for analysis (Pass 1: flash-lite)...")
@@ -351,6 +396,13 @@ def main():
                 title_found = True
                 is_definitive = False
                 print(f"    [+] Falling back to Working Title: {title_val}")
+
+            # 2d. OVERRIDE: If we didn't get an AI Overview, force (WT) classification on whatever title we found
+            if title_found and missing_ai_overview:
+                is_definitive = False
+                if not title_val.endswith("(WT)"):
+                    title_val = f"{title_val} (WT)"
+                print(f"    [!] No AI Overview available. Forcing Working Title fallback: {title_val}")
 
             # 3. Dedicated Fallback logic
             if title_found:
@@ -431,6 +483,14 @@ def main():
                             except FileNotFoundError:
                                 pass
 
+                    # NEW: Clean up the old metadata file so we don't leave orphans behind
+                    if metadata_filepath.exists() and metadata_filepath != new_meta_path:
+                        try:
+                            metadata_filepath.unlink()
+                            print(f"    [*] Cleaned up old orphaned metadata: {metadata_filepath.name}")
+                        except FileNotFoundError:
+                            pass
+
                 # Save parsed metadata
                 with open(new_meta_path, "w", encoding="utf-8") as meta_file:
                     json.dump(parsed_metadata, meta_file, indent=4)
@@ -457,12 +517,22 @@ def main():
             print(f"[!] Unexpected error on {filepath.name}: {e}")
 
     # --- FINAL ERROR REPORTING ---
+    print("\n" + "=" * 50)
+    print("FINAL RUN REPORT:")
+    print("=" * 50)
+
+    if skipped_files:
+        print(f"[*] Skipped {len(skipped_files)} file(s) (metadata already exists):")
+        for f in skipped_files:
+            print(f"    - {f}")
+
     if run_errors:
-        print("\n" + "=" * 50)
-        print("PROCESS COMPLETED WITH WARNINGS/ERRORS:")
-        print("=" * 50)
+        print(f"\n[*] Encountered {len(run_errors)} warning(s)/error(s):")
         for error in run_errors:
-            print(f" - {error}")
+            print(f"    - {error}")
+
+    if not skipped_files and not run_errors:
+        print("[*] Pipeline completed successfully with zero warnings or errors.")
 
 
 if __name__ == "__main__":
