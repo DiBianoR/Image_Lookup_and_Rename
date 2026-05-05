@@ -9,11 +9,11 @@ from google import genai
 # ==========================================
 # Configuration
 # ==========================================
-SERPAPI_KEY = os.getenv("SERPAPI_KEY", "????")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "????")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY", "?????")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "?????")
 
-DIRECTORY_PATH = r"\\????\Abyss Web Server\htdocs\tmp"
-BASE_URL = "https://????/tmp/"
+DIRECTORY_PATH = r"\\?????\Abyss Web Server\htdocs\tmp"
+BASE_URL = "https://?????/tmp/"
 
 # --- PROCESSING SWITCHES ---
 RENAME_FILES = True  # Set to False to keep original filenames
@@ -57,11 +57,11 @@ GEMINI_SCHEMA = {
         },
         "source": {
             "type": ["string", "null"],
-            "description": "Source Publication, Publication Context, or Original Appearance - where the piece made its public debut."
+            "description": "Source Publication, Publication Context, or Original Appearance - where the piece made its public debut. Or null if not found."
         },
         "format": {
             "type": ["string", "null"],
-            "description": "This describes the specific function the artwork was commissioned to serve within the publication - Cover Art / Magazine cover / book cover / module wrap / Interior Illustration / Promotional / Packaging / Private Commission etc."
+            "description": "This describes the specific function the artwork was commissioned to serve within the publication - Cover Art, Magazine Cover, Book Cover, Module Wrap, Interior Illustration, Promotional, Packaging, Private Commission, etc. Or null if not found."
         },
         "medium": {
             "type": ["string", "null"],
@@ -73,7 +73,7 @@ GEMINI_SCHEMA = {
         },
         "title_guess": {
             "type": ["string", "null"],
-            "description": "Title of work if definitively found, a best guess if a likely/possible title was found but it was not definitive, null otherwise."
+            "description": "Title of work if definitively found, a best guess if a likely title was found but it was not definitive, 'source' or 'source - format' sometimes can work as a title if you have source, null otherwise."
         }
     },
     "required": [
