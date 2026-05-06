@@ -18,8 +18,26 @@ BASE_URL = "https://????/tmp/"
 
 # --- PROCESSING SWITCHES ---
 RENAME_FILES = True  # Set to False to keep original filenames
+TITLE_UNKNOWNS_BY_SUBJECT = True # just give it a name based on what we see if we can't find the name
+SCRUB_EMOJIS_FROM_LLM_INPUT = True  # Set to True to strip emojis before sending data to Gemini (prevents some crashes)
 SAVE_RAW_LENS_DATA = True  # Set to True to save the raw SerpApi response to a '_tmp.json' file
 REDO_LLM = False  # Set to True to re-run Gemini on files that already have a final .json metadata file
+
+# Globally disable safety filters for art processing
+DEFAULT_SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+]
+
+LENS_QUERY_TEMP = 1.0
+SIMPLE_SEARCH_TEMP = 0.85
+STRING_EXTRACTION_TEMP = 0.1
+
+# Regex to match Python's escaped Unicode surrogate pairs (e.g., \uD83D\uDE00)
+# and standard escaped Unicode characters in the upper ranges (e.g., \u2694)
+ESCAPED_EMOJI_PATTERN = re.compile(r'(\\u[dD][a-fA-F0-9]{3}\\u[dD][a-fA-F0-9]{3}|\\u2[0-9a-fA-F]{3}|\\u[fF][0-9a-fA-F]{3})')
 
 # Initialize the Gemini client
 client = genai.Client(api_key=GOOGLE_API_KEY)
@@ -34,7 +52,7 @@ GEMINI_SCHEMA = {
         },
         "title_found": {
             "type": "boolean",
-            "description": "Was the title definitively found?"
+            "description": "Was the title definitively found? If there were multiple likely options, this is False."
         },
         "title_of_work": {
             "type": ["string", "null"],
@@ -74,12 +92,16 @@ GEMINI_SCHEMA = {
         },
         "title_guess": {
             "type": ["string", "null"],
-            "description": "Title of work if definitively found, a best guess if a likely title was found but it was not definitive, 'source' or 'source - format' sometimes can work as a title if you have source, null otherwise."
+            "description": "Title of work if definitively found, a best guess if a likely title was found but it was not definitive, If there were multiple likely options, prioritize ai_overview's guess, 'source' or 'source - format' sometimes can work as a title if you have source[above], null otherwise."
+        },
+        "subject": {
+            "type": ["string", "null"],
+            "description": "Title aside, [if it was mentioned in the search results] what is this an image of? Null if it is unclear or not mentioned."
         }
     },
     "required": [
-        "query_response", "title_found", "title_of_work", "artist_name",
-        "year_of_completion", "source", "format", "medium", "dimensions", "title_guess"
+        "query_response", "title_found", "title_of_work", "artist_name", "year_of_completion",
+        "source", "format", "medium", "dimensions", "title_guess", "subject"
     ]
 }
 
@@ -222,66 +244,107 @@ def fetch_full_ai_overview(ai_overview_dict: dict, error_list: list, filename: s
     return {}  # Wipe the token out since it failed
 
 
-def analyze_json_with_gemini(lens_json_data: dict, model_name: str = "gemini-2.5-flash-lite", temp: float = 0.0) -> str:
-    """Passes the raw Lens JSON to Gemini for structured extraction."""
-    prompt = f"```json\n{json.dumps(lens_json_data)}\n```\n"
-    prompt += "Using only this json, without looking online or at any other sources, can you definitively say what the title of the image in question is? Titles from Arthive are not reliable."
+def analyze_json_with_gemini(lens_json_data: dict, model_name: str = "gemini-2.5-flash-lite", temp: float = 1.0) -> str:
+    """Passes the raw Lens JSON to Gemini for structured extraction. Defaults to the cheapest model"""
 
+    raw_json_str = json.dumps(lens_json_data)  # Python will escape emojis into ASCII strings
+
+    if SCRUB_EMOJIS_FROM_LLM_INPUT:
+        sanitized_json_str = ESCAPED_EMOJI_PATTERN.sub('', raw_json_str)
+    else:
+        sanitized_json_str = raw_json_str
+
+    prompt = f"```json\n{sanitized_json_str}\n```\n"
+    prompt += """\
+Using only this json, without looking online or at any other sources, can you definitively say what the title of the image in question is?
+Titles from arthive are not reliable."""
+
+    # 1. Define your base configuration that works for all models
+    gen_config = {
+        "response_mime_type": "application/json",
+        "response_json_schema": GEMINI_SCHEMA,
+        "temperature": temp,
+        "safety_settings": DEFAULT_SAFETY_SETTINGS
+    }
+
+    # 2. Check the model name and bump the thinking level up one notch ("low")
+    # This prevents the script from crashing if you swap to a model like 2.5-flash-lite
+    # that doesn't support this specific thinking parameter, or 3-flash which defaults to "high".
+    if model_name == "gemini-3.1-flash-lite-preview":
+        gen_config["thinking_config"] = {"thinking_level": "low"}
+
+    # 3. Pass the dynamic config dict to the client
     response = client.models.generate_content(
         model=model_name,
         contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_json_schema": GEMINI_SCHEMA,
-            "temperature": temp
-        },
+        config=gen_config,
     )
     return response.text
 
 
-def search_missing_artist(title: str, current_metadata: dict) -> dict:
+def search_missing_artist(title: str, current_metadata: dict, model_name: str = "gemini-2.5-flash-lite") -> dict:
     """Two-step process: Searches Google for the artist, then extracts to JSON."""
-    search_prompt = f"We have identified an artwork titled '{title}'. Here is the current known metadata: {json.dumps(current_metadata)}\n\n"
-    search_prompt += "Using Google Search, find the name of the original artist for this specific artwork. Provide a brief text summary of your findings."
+
+    search_prompt = f"""\
+We have identified an artwork titled '{title}'. Here is the current known metadata:
+{json.dumps(current_metadata)}
+
+Using Google Search, find the name of the original artist for this specific artwork. Provide a brief text summary of your findings."""
 
     search_response = client.models.generate_content(
-        model="gemini-2.5-flash-lite",
+        model=model_name,
         contents=search_prompt,
-        config={"temperature": 0.0, "tools": [{"google_search": {}}]},
+        config={"temperature": SIMPLE_SEARCH_TEMP, "tools": [{"google_search": {}}]},
     )
 
-    extract_prompt = f"Based ONLY on the following text, extract the artist's name. If no specific artist is confirmed, return null.\n\nText:\n{search_response.text}"
+    extract_prompt = f"""\
+We have identified an artwork titled '{title}'. Using Google Search, find the name of the original artist for this specific artwork. Provide a brief text summary of your findings.
+[search completed]
+summary_of_findings:
+{search_response.text}
+Based on the summary, extract the artist's name. If there is confusion, or no specific artist is confirmed, return null."""
+
     extract_response = client.models.generate_content(
-        model="gemini-2.5-flash-lite",
+        model=model_name,
         contents=extract_prompt,
         config={
             "response_mime_type": "application/json",
             "response_json_schema": ARTIST_FOLLOWUP_SCHEMA,
-            "temperature": 0.0
+            "temperature": STRING_EXTRACTION_TEMP
         },
     )
     return json.loads(extract_response.text)
 
 
-def search_missing_year(title: str, current_metadata: dict) -> dict:
+def search_missing_year(title: str, current_metadata: dict, model_name: str = "gemini-2.5-flash-lite") -> dict:
     """Two-step process: Searches Google for the year, then extracts to JSON."""
-    search_prompt = f"We have identified an artwork titled '{title}'. Here is the current known metadata: {json.dumps(current_metadata)}\n\n"
-    search_prompt += "Using Google Search, find the year of completion or original publication for this specific artwork. Provide a brief text summary of your findings."
+
+    search_prompt = f"""\
+We have identified an artwork titled '{title}'. Here is the current known metadata:
+{json.dumps(current_metadata)}
+
+Using Google Search, find the year of completion or original publication for this specific artwork. Provide a brief text summary of your findings."""
 
     search_response = client.models.generate_content(
-        model="gemini-2.5-flash-lite",
+        model=model_name,
         contents=search_prompt,
-        config={"temperature": 0.0, "tools": [{"google_search": {}}]},
+        config={"temperature": SIMPLE_SEARCH_TEMP, "tools": [{"google_search": {}}]},
     )
 
-    extract_prompt = f"Based ONLY on the following text, extract the year of completion. If no specific year is confirmed, return null.\n\nText:\n{search_response.text}"
+    extract_prompt = f"""
+We have identified an artwork titled '{title}'. Using Google Search, find the year of completion or original publication for this specific artwork. Provide a brief text summary of your findings.
+[search completed]
+summary_of_findings:
+{search_response.text}
+Based on the summary, extract the year of completion. If there is confusion, or no specific year is confirmed, return null."""
+
     extract_response = client.models.generate_content(
-        model="gemini-2.5-flash-lite",
+        model=model_name,
         contents=extract_prompt,
         config={
             "response_mime_type": "application/json",
             "response_json_schema": YEAR_FOLLOWUP_SCHEMA,
-            "temperature": 0.0
+            "temperature": STRING_EXTRACTION_TEMP
         },
     )
     return json.loads(extract_response.text)
@@ -371,7 +434,7 @@ def main():
 
             # 2. Pass the data to Gemini for extraction
             print("[*] Passing data to Gemini for analysis (Pass 1: flash-lite)...")
-            gemini_output = analyze_json_with_gemini(lens_data, model_name="gemini-2.5-flash-lite", temp=0.0)
+            gemini_output = analyze_json_with_gemini(lens_data, model_name="gemini-3.1-flash-lite-preview", temp=LENS_QUERY_TEMP)
             parsed_metadata = json.loads(gemini_output)
 
             # Evaluate First Pass
@@ -381,8 +444,8 @@ def main():
 
             # 2b. Second Pass if Title not found
             if not title_found:
-                print("[*] Title not found definitively. Retrying (Pass 2: flash, temp 0.1)...")
-                gemini_output_pass2 = analyze_json_with_gemini(lens_data, model_name="gemini-2.5-flash", temp=0.1)
+                print("[*] Title not found definitively. Retrying (Pass 2: flash)...")
+                gemini_output_pass2 = analyze_json_with_gemini(lens_data, model_name="gemini-3-flash-preview", temp=LENS_QUERY_TEMP)
                 parsed_metadata = json.loads(gemini_output_pass2)
 
                 # Re-evaluate
@@ -390,19 +453,25 @@ def main():
                 title_found = parsed_metadata.get("title_found") and title_val
                 is_definitive = title_found
 
-            # 2c. Fallback to title_guess (Working Title)
-            if not title_found and parsed_metadata.get("title_guess"):
-                title_val = f"{parsed_metadata.get('title_guess')} (WT)"
-                title_found = True
-                is_definitive = False
-                print(f"    [+] Falling back to Working Title: {title_val}")
+            # 2c. Fallback to title_guess or subject(Working Title)
+            if not title_found:
+                if parsed_metadata.get("title_guess"):
+                    title_val = f"{parsed_metadata.get('title_guess')} (WT)"
+                    title_found = True
+                    is_definitive = False
+                    print(f"    [+] Falling back to Working Title: {title_val}")
+                elif TITLE_UNKNOWNS_BY_SUBJECT and parsed_metadata.get("subject"):
+                    title_val = f"{parsed_metadata.get('subject')} (WT)"
+                    title_found = True
+                    is_definitive = False
+                    print(f"    [+] Falling back to Image Subject: {title_val}")
 
             # 2d. OVERRIDE: If we didn't get an AI Overview, force (WT) classification on whatever title we found
             if title_found and missing_ai_overview:
                 is_definitive = False
                 if not title_val.endswith("(WT)"):
                     title_val = f"{title_val} (WT)"
-                print(f"    [!] No AI Overview available. Forcing Working Title fallback: {title_val}")
+                    print(f"    [!] No AI Overview available. Forcing Working Title fallback: {title_val}")
 
             # 3. Dedicated Fallback logic
             if title_found:
@@ -512,9 +581,17 @@ def main():
                 print(f"\n[*] Final Extracted Data:\n[==>] FILE RENAMED: {print_artist}{sep}{print_title}{yr}")
 
         except requests.exceptions.RequestException as e:
-            print(f"[!] API Error processing {filepath.name}: {e}")
+            err_msg = f"Network/API Error on {filepath.name}: {e}"
+            print(f"[!] {err_msg}")
+            run_errors.append(err_msg)
+        except json.JSONDecodeError as e:
+            err_msg = f"JSON Truncation Error on {filepath.name}: {e}"
+            print(f"[!] {err_msg}")
+            run_errors.append(err_msg)
         except Exception as e:
-            print(f"[!] Unexpected error on {filepath.name}: {e}")
+            err_msg = f"Unexpected Error on {filepath.name}: {e}"
+            print(f"[!] {err_msg}")
+            run_errors.append(err_msg)
 
     # --- FINAL ERROR REPORTING ---
     print("\n" + "=" * 50)
@@ -522,16 +599,14 @@ def main():
     print("=" * 50)
 
     if skipped_files:
-        print(f"[*] Skipped {len(skipped_files)} file(s) (metadata already exists):")
-        for f in skipped_files:
-            print(f"    - {f}")
+        print(f"[*] Skipped {len(skipped_files)} file(s) (metadata already exists).")
 
     if run_errors:
         print(f"\n[*] Encountered {len(run_errors)} warning(s)/error(s):")
         for error in run_errors:
             print(f"    - {error}")
 
-    if not skipped_files and not run_errors:
+    if not run_errors:
         print("[*] Pipeline completed successfully with zero warnings or errors.")
 
 
