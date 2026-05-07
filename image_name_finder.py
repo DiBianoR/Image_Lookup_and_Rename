@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 import json
 import urllib.parse
@@ -6,15 +7,33 @@ import re
 import time
 from pathlib import Path
 from google import genai
+from dotenv import load_dotenv
+
+# Load environment variables from the .env file
+load_dotenv()
 
 # ==========================================
 # Configuration
 # ==========================================
-SERPAPI_KEY = os.getenv("SERPAPI_KEY", "????")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "????")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+DIRECTORY_PATH = os.getenv("DIRECTORY_PATH")
+BASE_URL = os.getenv("BASE_URL")
 
-DIRECTORY_PATH = r"\\????\Abyss Web Server\htdocs\tmp"
-BASE_URL = "https://????/tmp/"
+# Safety check for distributed use
+if not SERPAPI_KEY or not GOOGLE_API_KEY or SERPAPI_KEY == "your_serpapi_key_here" or GOOGLE_API_KEY == "your_google_api_key_here":
+    print("[!] ERROR: Missing API Key(s).")
+    print("    Please open the .env file and paste your SerpApi and Google API keys.")
+    sys.exit(1)
+
+if not DIRECTORY_PATH or not BASE_URL or DIRECTORY_PATH == "your_image_directory_here" or BASE_URL == "your_image_directory_url_here":
+    print("[!] ERROR: Missing Directory or Base URL.")
+    print("    Please open the .env file and configure your DIRECTORY_PATH and BASE_URL.")
+    sys.exit(1)
+
+# Ensure the Base URL always ends with a slash so urllib doesn't mangle the file paths
+if not BASE_URL.endswith('/'):
+    BASE_URL += '/'
 
 # --- PROCESSING SWITCHES ---
 RENAME_FILES = True  # Set to False to keep original filenames
@@ -138,9 +157,44 @@ YEAR_FOLLOWUP_SCHEMA = {
 
 
 def sanitize_filename(name: str) -> str:
-    """Removes characters that are illegal in Windows file paths."""
-    safe_name = re.sub(r'[\\/*?:"<>|]', "", name)
+    """Removes characters that are illegal in Windows file paths, including hidden control/null bytes."""
+    # \x00-\x1f catches all invisible control characters (including the null byte \x00)
+    safe_name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", name)
     return safe_name.strip()
+
+
+def clean_redundant_title_text(title: str, first: str, last: str, year: int) -> str:
+    """Strips redundant artist names from the start and years from the end of a title string."""
+    if not title:
+        return title
+
+    cleaned = title.strip()
+
+    # 1. Strip Year from the end
+    if year:
+        y_str = str(year)
+        # Matches: " 1984", " - 1984", " (1984)", " [1984]", ", 1984" exactly at the end of the string
+        year_pattern = r'\s*[\,\-]?\s*[\(\[]?' + y_str + r'[\)\]]?\s*$'
+        cleaned = re.sub(year_pattern, '', cleaned, flags=re.IGNORECASE)
+
+    # 2. Strip Artist from the beginning
+    artist_patterns = []
+    if first and last:
+        artist_patterns.append(re.escape(f"{first} {last}"))
+        artist_patterns.append(re.escape(f"{last}, {first}"))
+        artist_patterns.append(re.escape(f"{last} {first}"))
+    elif last:
+        artist_patterns.append(re.escape(last))
+    elif first:
+        artist_patterns.append(re.escape(first))
+
+    if artist_patterns:
+        # Combine patterns: Matches any of the artist formats at the start of the string, plus trailing separators
+        combined_artists = "|".join(artist_patterns)
+        artist_regex = r'^(' + combined_artists + r')\s*[\,\-]?\s*'
+        cleaned = re.sub(artist_regex, '', cleaned, flags=re.IGNORECASE)
+
+    return cleaned.strip()
 
 
 def get_unique_base_name(directory: Path, desired_base: str, original_filepath: Path) -> str:
@@ -171,15 +225,33 @@ def get_unique_base_name(directory: Path, desired_base: str, original_filepath: 
 
 def scrub_lens_data(data: dict) -> bool:
     """
-    Removes search_metadata and search_parameters from the SerpApi JSON.
-    This prevents 'data leakage' where the LLM sees the original filename via the query URL.
-    Returns True if the data was modified.
+    Specifically targets and removes tracking data and useless token-bloat
+    (like pricing, reviews, and image URLs) strictly from the visual_matches list.
     """
     modified = False
-    for key in ["search_metadata", "search_parameters"]:
-        if key in data:
-            del data[key]
+
+    # 1. Remove top-level tracking blocks
+    for top_key in ["search_metadata", "search_parameters", "lens_detect_zones"]:
+        if top_key in data:
+            del data[top_key]
             modified = True
+
+    # The exact keys we want to purge from individual match items
+    match_keys_to_purge = {
+        "source_icon", "price", "in_stock", "rating", "reviews"
+        # ,"thumbnail", "thumbnail_width", "thumbnail_height", "image", "image_width", "image_height"
+    }
+
+    # 2. Target specific fields exactly one level deep inside matches
+    for list_key in ["visual_matches", "shopping_results"]:
+        if list_key in data and isinstance(data[list_key], list):
+            for match in data[list_key]:
+                # We use list(match.keys()) so we can delete keys while iterating
+                for key in list(match.keys()):
+                    if key in match_keys_to_purge:
+                        del match[key]
+                        modified = True
+
     return modified
 
 
@@ -364,6 +436,48 @@ def main():
 
     files_to_process = [f for f in image_dir.iterdir() if f.is_file() and f.suffix.lower() in image_extensions]
 
+    # --- COST ESTIMATION LOGIC ---
+    #   assuming ~15K In + ~1K Out
+    COST_SERPAPI = 0.025
+    COST_PASS1 = 0.0053              # gemini-3.1-flash-lite-preview
+    COST_PASS2 = 0.0105              # gemini-3-flash-preview
+    COST_FALLBACK_ARTIST = 0.0019 * 2  # 2 calls to gemini-2.5-flash-lite
+    COST_FALLBACK_YEAR = 0.0019 * 2    # 2 calls to gemini-2.5-flash-lite
+
+    MAX_COST_PER_FILE = COST_SERPAPI + COST_PASS1 + COST_PASS2 + COST_FALLBACK_ARTIST + COST_FALLBACK_YEAR
+
+    # Calculate exactly how many files will trigger processing
+    active_files = 0
+    for filepath in files_to_process:
+        if filepath.with_suffix('.json').exists() and not REDO_LLM:
+            continue
+        active_files += 1
+
+    if active_files == 0:
+        print("[*] No new files to process.")
+        return
+
+    total_max_cost = active_files * MAX_COST_PER_FILE
+
+    print("\n" + "=" * 50)
+    print("COST ESTIMATION (UPPER LIMIT)")
+    print("=" * 50)
+    print(f"Active files to process: {active_files}")
+    print(f"Max cost per file:       ${MAX_COST_PER_FILE:.4f}")
+    print(f"  - SerpApi:             ${COST_SERPAPI:.4f}")
+    print(f"  - Pass 1 (3.1 Lite):   ${COST_PASS1:.4f}")
+    print(f"  - Pass 2 (3 Flash):    ${COST_PASS2:.4f}")
+    print(f"  - Fallbacks (Artist & Year): ${(COST_FALLBACK_ARTIST + COST_FALLBACK_YEAR):.4f}")
+    print("-" * 50)
+    print(f"Max Total Batch Cost:    ${total_max_cost:.4f}")
+    print("=" * 50)
+
+    user_input = input("Proceed with processing? (y/n): ")
+    if user_input.lower() not in ['y', 'yes']:
+        print("[*] Processing aborted by user.")
+        sys.exit()
+
+    # --- MAIN PROCESSING LOOP ---
     for filepath in files_to_process:
         print(f"\n" + "=" * 50)
         print(f"Processing: {filepath.name}")
@@ -511,14 +625,23 @@ def main():
             if title_found:
                 artist_str = artist_val or "Artist unknown"
                 year_str = f" ({year_val})" if year_val else ""
-                raw_new_name = f"{artist_str} - {title_val}{year_str}"
+
+                # Clean the LLM's title to prevent "Caldwell, Clyde - Caldwell, Clyde"
+                clean_title = clean_redundant_title_text(title_val, first_name, last_name, year_val)
+                # If the cleaning stripped EVERYTHING (e.g. the original title was literally just "Caldwell 1984"), fallback to something safe
+                clean_title = clean_title if clean_title else "Unknown Title"
+
+                raw_new_name = f"{artist_str} - {clean_title}{year_str}"
 
                 # Clean strings for console output
                 print_artist = artist_str
-                print_title = title_val
+                print_title = clean_title
                 print_year = year_val or "?"
             else:
-                title_str = filepath.stem
+                # Clean the original filename so it doesn't double-up when we prepend the artist
+                clean_stem = clean_redundant_title_text(filepath.stem, first_name, last_name, year_val)
+                title_str = clean_stem if clean_stem else "Unknown Image"
+
                 artist_str = f"{artist_val} - " if artist_val else ""
                 year_str = f" ({year_val})" if year_val else ""
                 raw_new_name = f"{artist_str}{title_str}{year_str}"
