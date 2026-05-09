@@ -1,0 +1,27 @@
+Gemini Model Comparison (Sorted by Reasoning/Intelligence)
+-----------------------
+Model,Avg. Output Speed (Tokens/Sec),Small Query Cost (15K In + 1K Out),Big Query Cost (400K In + 8K Out)
+Gemini 3.1 Pro,~121 t/s,$0.0420,$1.7440
+Gemini 3 Flash,~195.5 t/s,$0.0105,$0.2240
+Gemini 2.5 Pro,~128 t/s,$0.0287,$1.1200
+Gemini 3.1 Flash-Lite,~356 t/s,$0.0053,$0.1120
+Gemini 2.5 Flash,~243.5 t/s,$0.0070,$0.1400
+Gemini 2.5 Flash Lite,~307 t/s,$0.0019,$0.0432
+
+Google Search:
+  gemini-2.5-flash-lite free: 1500/day, then $0.035
+  gemini-3.1-flash-lite free: 5000/month, then $0.014
+Scrape.do: ~$.00116
+Serper.dev: ~$0.00030
+
+Fully Describe 1080p Image (in 3000 tokens), thinking - minimal
+Gemini 3 Flash: $0.009516
+Gemini 3.1 Flash-Lite: $0.004758
+Gemini 2.5 Flash: $0.007809
+Gemini 2.5 Flash-Lite: $0.001303
+
+Google Lens Call(via SerpAPI) $25/mo Starter Plan: $0.025
+Google Lens Call(via SerpAPI) $150/mo Production Plan: $0.01
+Bing Visual Search API: .014
+Google Cloud Vision Search: free: 1000/month, then $0.0035  # Web Entities + Pixel Match
+TinEye: $0.04

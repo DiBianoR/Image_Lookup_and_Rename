@@ -141,7 +141,7 @@ ARTIST_FOLLOWUP_SCHEMA = {
             "description": "The artist's last name if known, null otherwise. If the artist goes by a single name or pseudonym (e.g., 'Brom'), place it here."
         }
     },
-    "required": ["artist_name"]
+    "required": ["artist_name", "artist_first_name", "artist_last_name"]
 }
 
 YEAR_FOLLOWUP_SCHEMA = {
@@ -343,7 +343,7 @@ Titles from arthive are not reliable."""
     # This prevents the script from crashing if you swap to a model like 2.5-flash-lite
     # that doesn't support this specific thinking parameter, or 3-flash which defaults to "high".
     if model_name == "gemini-3.1-flash-lite-preview":
-        gen_config["thinking_config"] = {"thinking_level": "low"}
+        gen_config["thinking_config"] = {"thinking_level": "low"}  # minimal -> low -> medium -> high
 
     # 3. Pass the dynamic config dict to the client
     response = client.models.generate_content(
@@ -439,12 +439,15 @@ def main():
     # --- COST ESTIMATION LOGIC ---
     #   assuming ~15K In + ~1K Out
     COST_SERPAPI = 0.025
-    COST_PASS1 = 0.0053              # gemini-3.1-flash-lite-preview
-    COST_PASS2 = 0.0105              # gemini-3-flash-preview
-    COST_FALLBACK_ARTIST = 0.0019 * 2  # 2 calls to gemini-2.5-flash-lite
-    COST_FALLBACK_YEAR = 0.0019 * 2    # 2 calls to gemini-2.5-flash-lite
+    COST_PASS1 = 0.00775              # gemini-3.1-flash-lite-preview
+    COST_PASS2 = 0.02300              # gemini-3-flash-preview
+    COST_FALLBACK_ARTIST = 0.00011 + 0.000054  # 2 calls to gemini-2.5-flash-lite
+    COST_FALLBACK_YEAR = 0.00011 + 0.000054  # 2 calls to gemini-2.5-flash-lite
+    COST_FALLBACK_ARTIST_GT_1500_DAILY = 0.03511 + 0.000054  # 2 calls to gemini-2.5-flash-lite
+    COST_FALLBACK_YEAR_GT_1500_DAILY = 0.03511 + 0.000054  # 2 calls to gemini-2.5-flash-lite
 
     MAX_COST_PER_FILE = COST_SERPAPI + COST_PASS1 + COST_PASS2 + COST_FALLBACK_ARTIST + COST_FALLBACK_YEAR
+    MAX_COST_PER_FILE_GT_1500_DAILY = MAX_COST_PER_FILE - COST_FALLBACK_ARTIST - COST_FALLBACK_YEAR + COST_FALLBACK_ARTIST_GT_1500_DAILY + COST_FALLBACK_YEAR_GT_1500_DAILY
 
     # Calculate exactly how many files will trigger processing
     active_files = 0
