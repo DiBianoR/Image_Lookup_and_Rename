@@ -20,8 +20,6 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 DIRECTORY_PATH = os.getenv("DIRECTORY_PATH")
 BASE_URL = os.getenv("BASE_URL")
-
-# --- NEW BULK PROCESSING TOGGLES ---
 IMAGE_BACKEND = os.getenv("IMAGE_BACKEND", "serpapi").lower()
 ENABLE_PASS_2 = os.getenv("ENABLE_PASS_2", "True").lower() in ['true', '1', 't', 'y', 'yes']
 
