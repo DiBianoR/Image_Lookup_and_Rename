@@ -57,9 +57,9 @@ if not BASE_URL.endswith('/'):
 RENAME_FILES = True  # Set to False to keep original filenames
 TITLE_UNKNOWNS_BY_SUBJECT = True  # just give it a name based on what we see if we can't find the name
 SCRUB_EMOJIS_FROM_LLM_INPUT = True  # Set to True to strip emojis before sending data to Gemini (prevents some crashes)
-SAVE_RAW_LENS_DATA = True  # Set to True to save the raw SerpApi response to a '_tmp.json' file
+SAVE_RAW_IMAGE_SEARCH_DATA = True  # Set to True to save the raw Image Search response to a '_tmp.json' file
 REDO_LLM = False  # Set to True to re-run Gemini on files that already have a final .json metadata file
-PASSWORD=GORILLE
+
 # Globally disable safety filters for art processing
 DEFAULT_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
@@ -68,7 +68,7 @@ DEFAULT_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
 ]
 
-LENS_QUERY_TEMP = 1.0
+IMAGE_QUERY_TEMP = 1.0
 SIMPLE_SEARCH_TEMP = 0.85
 STRING_EXTRACTION_TEMP = 0.1
 
@@ -294,8 +294,8 @@ def search_google_lens(image_url: str) -> dict:
     return response.json()
 
 
-def search_google_vision(image_url: str) -> dict:
-    """Calls Google Cloud Vision API Web Detection and formats the output cleanly."""
+def search_google_vision_raw(image_url: str) -> dict:
+    """Calls Google Cloud Vision API Web Detection and returns the raw unformatted dictionary."""
     vision_client = vision.ImageAnnotatorClient()
     image = vision.Image()
     image.source.image_uri = image_url
@@ -304,38 +304,8 @@ def search_google_vision(image_url: str) -> dict:
     if response.error.message:
         raise Exception(f"Vision API Error: {response.error.message}")
 
-    annotations = response.web_detection
-
-    # Format into a clean, LLM-friendly dictionary
-    vision_data = {
-        "web_entities": [{"description": entity.description, "score": entity.score}
-                         for entity in annotations.web_entities if entity.description],
-        "pages_with_matching_images": [{"url": page.url, "page_title": page.page_title}
-                                       for page in annotations.pages_with_matching_images if page.page_title],
-        "best_guess_labels": [label.label for label in annotations.best_guess_labels]
-    }
-    return vision_data
-
-
-def generate_vision_overview(vision_data: dict, model_name: str = "gemini-3.1-flash-lite-preview") -> str:
-    """Uses Gemini to synthesize an ai_overview paragraph from raw Vision data."""
-    if not vision_data.get("web_entities") and not vision_data.get("pages_with_matching_images"):
-        return ""
-
-    prompt = f"""
-Given the following raw web detection data for an image, write a single concise paragraph summarizing what this image is. 
-Focus on identifying the artist, title, subject matter, and year if available in the data.
-Do not mention the data structure, just summarize the facts as if you were an encyclopedia.
-
-Raw Data:
-{json.dumps(vision_data, indent=2)}
-"""
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config={"temperature": 0.2}
-    )
-    return response.text
+    # Convert the raw protobuf response to a standard python dictionary
+    return type(response).to_dict(response)
 
 
 def fetch_full_ai_overview(ai_overview_dict: dict, error_list: list, filename: str) -> dict:
@@ -379,10 +349,10 @@ def fetch_full_ai_overview(ai_overview_dict: dict, error_list: list, filename: s
     return {}  # Wipe the token out since it failed
 
 
-def analyze_json_with_gemini(lens_json_data: dict, model_name: str = "gemini-2.5-flash-lite", temp: float = 1.0) -> str:
-    """Passes the raw Lens JSON to Gemini for structured extraction. Defaults to the cheapest model"""
+def analyze_json_with_gemini(image_json_data: dict, model_name: str = "gemini-2.5-flash-lite", temp: float = 1.0) -> str:
+    """Passes the raw Image JSON to Gemini for structured extraction. Defaults to the cheapest model"""
 
-    raw_json_str = json.dumps(lens_json_data)  # Python will escape emojis into ASCII strings
+    raw_json_str = json.dumps(image_json_data)  # Python will escape emojis into ASCII strings
 
     if SCRUB_EMOJIS_FROM_LLM_INPUT:
         sanitized_json_str = ESCAPED_EMOJI_PATTERN.sub('', raw_json_str)
@@ -512,11 +482,11 @@ def main():
 
     # --- COST ESTIMATION LOGIC ---
     COST_IMAGE_SEARCH_SERPAPI = 0.025
-    COST_IMAGE_SEARCH_VISION = 0.0055  # 0.0035 Vision + 0.0020 LLM overview
-    COST_PASS1 = 0.00775
-    COST_PASS2 = 0.02300
+    COST_IMAGE_SEARCH_VISION = 0.0035
+    COST_PASS1 = 0.00775  # Gemini 3.1 Flash-Lite (Thinking Level: LOW), 25000/1000
+    COST_PASS2 = 0.02300  # Gemini 3 Flash (Thinking Level: HIGH), 25000/3500
     COST_FALLBACK_TOKENS = 0.0019 * 2  # Gemini 2.5 Flash-Lite
-    GROUNDING_SEARCH_COST = 0.035  # $35 per 1000 after 1500 free queries
+    GROUNDING_SEARCH_COST = 0.035  # after 1500 free queries/day
 
     total_image_search_cost = active_files * (
         COST_IMAGE_SEARCH_SERPAPI if IMAGE_BACKEND == "serpapi" else COST_IMAGE_SEARCH_VISION)
@@ -560,8 +530,8 @@ def main():
         print(f"Processing: {filepath.name}")
         print("=" * 50)
 
-        # Explicitly separate the raw SerpApi JSON from the parsed Metadata JSON
-        raw_lens_filepath = filepath.with_name(f"{filepath.stem}_tmp.json")
+        # Explicitly separate the raw Image Search JSON from the parsed Metadata JSON
+        raw_image_search_filepath = filepath.with_name(f"{filepath.stem}_tmp.json")
         metadata_filepath = filepath.with_suffix('.json')
 
         # Check if we should skip this file based on REDO_LLM flag
@@ -575,72 +545,70 @@ def main():
             # 1. Handle Image Search Data
             needs_api_fetch = True
 
-            if raw_lens_filepath.exists():
-                with open(raw_lens_filepath, "r", encoding="utf-8") as f:
-                    lens_data = json.load(f)
+            if raw_image_search_filepath.exists():
+                # fetch
+                with open(raw_image_search_filepath, "r", encoding="utf-8") as f:
+                    image_data = json.load(f)
 
+               # scrub, and mark as fetched
                 if IMAGE_BACKEND == "serpapi":
                     # Scrub existing cache to prevent filename data leakage
-                    cache_modified = scrub_lens_data(lens_data)
+                    cache_modified = scrub_lens_data(image_data)
 
                     # If a local cache contains a page_token, OR if the ai_overview is literally {}, it is expired/failed.
-                    if "ai_overview" in lens_data and (
-                            not lens_data["ai_overview"] or "page_token" in lens_data["ai_overview"]):
+                    if "ai_overview" in image_data and (
+                            not image_data["ai_overview"] or "page_token" in image_data["ai_overview"]):
                         warn_msg = f"Local cache contained an expired or empty AI Overview for {filepath.name}. Discarding cache."
                         print(f"    [!] {warn_msg}")
                         run_errors.append(warn_msg)
-                        raw_lens_filepath.unlink()  # Delete the expired/failed cache file
+                        raw_image_search_filepath.unlink()  # Delete the expired/failed cache file
                     else:
-                        print(f"[*] Found existing raw data: {raw_lens_filepath.name} (Skipping Search)")
+                        print(f"[*] Found existing raw data: {raw_image_search_filepath.name} (Skipping Search)")
                         needs_api_fetch = False
 
                         # If we modified the cache by scrubbing out the URLs, save it so it's clean for future runs
-                        if cache_modified and SAVE_RAW_LENS_DATA:
-                            with open(raw_lens_filepath, "w", encoding="utf-8") as f:
-                                json.dump(lens_data, f, indent=4)
+                        if cache_modified and SAVE_RAW_IMAGE_SEARCH_DATA:
+                            with open(raw_image_search_filepath, "w", encoding="utf-8") as f:
+                                json.dump(image_data, f, indent=4)
                             print("    [*] Scrubbed original filename leak from existing local cache.")
-                else:
-                    # Vision backend cache logic
-                    print(f"[*] Found existing Vision data: {raw_lens_filepath.name} (Skipping Search)")
+                else:  # IMAGE_BACKEND == "vision"
+                    print(f"[*] Found existing Vision data: {raw_image_search_filepath.name} (Skipping Search)")
                     needs_api_fetch = False
+                    # todo: scrub and resave if necessary
 
             if needs_api_fetch:
+                image_data = None
                 safe_filename = urllib.parse.quote(filepath.name)
                 public_url = f"{BASE_URL}{safe_filename}"
                 print(f"[*] Generated URL: {public_url}")
 
                 if IMAGE_BACKEND == "serpapi":
                     print("[*] Querying SerpApi Google Lens...")
-                    lens_data = search_google_lens(public_url)
+                    image_data = search_google_lens(public_url)
 
                     # Scrub the fresh data before anything else sees it
-                    scrub_lens_data(lens_data)
+                    scrub_lens_data(image_data)
 
                     # Intercept and fetch the full AI Overview immediately before it expires
-                    if "ai_overview" in lens_data:
-                        lens_data["ai_overview"] = fetch_full_ai_overview(lens_data["ai_overview"], run_errors,
-                                                                          filepath.name)
-
+                    if "ai_overview" in image_data:
+                        image_data["ai_overview"] = fetch_full_ai_overview(image_data["ai_overview"], run_errors, filepath.name)
                 elif IMAGE_BACKEND == "vision":
                     print("[*] Querying Google Cloud Vision...")
-                    lens_data = search_google_vision(public_url)
+                    image_data = search_google_vision_raw(public_url)
 
-                    print("[*] Synthesizing AI Overview from Vision Data...")
-                    synthesized_overview = generate_vision_overview(lens_data)
-                    lens_data["ai_overview"] = {"text_blocks": [{"snippet": synthesized_overview}]}
+                    # todo: scrub
 
-                if SAVE_RAW_LENS_DATA:
-                    with open(raw_lens_filepath, "w", encoding="utf-8") as json_file:
-                        json.dump(lens_data, json_file, indent=4)
-                    print(f"[*] Saved raw data to: {raw_lens_filepath.name}")
+                if SAVE_RAW_IMAGE_SEARCH_DATA:
+                    with open(raw_image_search_filepath, "w", encoding="utf-8") as json_file:
+                        json.dump(image_data, json_file, indent=4)
+                    print(f"[*] Saved raw data to: {raw_image_search_filepath.name}")
 
             # Assess if the AI Overview was completely empty or failed
-            missing_ai_overview = not bool(lens_data.get("ai_overview"))
+            missing_ai_overview = IMAGE_BACKEND == "serpapi" and not bool(image_data.get("ai_overview"))
 
             # 2. Pass the data to Gemini for extraction
             print("[*] Passing data to Gemini for analysis (Pass 1: flash-lite)...")
-            gemini_output = analyze_json_with_gemini(lens_data, model_name="gemini-3.1-flash-lite-preview",
-                                                     temp=LENS_QUERY_TEMP)
+            gemini_output = analyze_json_with_gemini(image_data, model_name="gemini-3.1-flash-lite-preview", temp=IMAGE_QUERY_TEMP)
             parsed_metadata = json.loads(gemini_output)
 
             # Evaluate First Pass
@@ -651,8 +619,7 @@ def main():
             # 2b. Second Pass if Title not found AND Pass 2 is enabled
             if not title_found and ENABLE_PASS_2:
                 print("[*] Title not found definitively. Retrying (Pass 2: flash)...")
-                gemini_output_pass2 = analyze_json_with_gemini(lens_data, model_name="gemini-3-flash-preview",
-                                                               temp=LENS_QUERY_TEMP)
+                gemini_output_pass2 = analyze_json_with_gemini(image_data, model_name="gemini-3-flash-preview", temp=IMAGE_QUERY_TEMP)
                 parsed_metadata = json.loads(gemini_output_pass2)
 
                 # Re-evaluate
@@ -760,13 +727,13 @@ def main():
                     filepath.rename(new_img_path)
 
                     # Manage the raw data file if we are saving it
-                    if raw_lens_filepath.exists():
-                        if SAVE_RAW_LENS_DATA:
-                            raw_lens_filepath.rename(new_raw_path)
+                    if raw_image_search_filepath.exists():
+                        if SAVE_RAW_IMAGE_SEARCH_DATA:
+                            raw_image_search_filepath.rename(new_raw_path)
                         else:
                             # Clean up if it was left over from a previous run
                             try:
-                                raw_lens_filepath.unlink()
+                                raw_image_search_filepath.unlink()
                             except FileNotFoundError:
                                 pass
 
