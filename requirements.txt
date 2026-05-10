@@ -1,3 +1,4 @@
 requests
 google-genai
 python-dotenv
+google-cloud-vision

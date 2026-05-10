@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.idea
+
+# Google Cloud Credentials
+gcp-vision-key.json
+*.json
