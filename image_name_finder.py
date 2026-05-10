@@ -29,6 +29,11 @@ if not GOOGLE_API_KEY or GOOGLE_API_KEY == "your_google_api_key_here":
     print("    Please open the .env file and paste your Google API key.")
     sys.exit(1)
 
+if IMAGE_BACKEND not in ["serpapi", "vision"]:
+    print(f"[!] ERROR: Invalid IMAGE_BACKEND '{IMAGE_BACKEND}'.")
+    print("    Please open the .env file and set IMAGE_BACKEND to either 'serpapi' or 'vision'.")
+    sys.exit(1)
+
 if IMAGE_BACKEND == "serpapi" and (not SERPAPI_KEY or SERPAPI_KEY == "your_serpapi_key_here"):
     print("[!] ERROR: Missing SerpApi Key.")
     print("    Please open the .env file and paste your SerpApi key, or switch IMAGE_BACKEND to 'vision'.")
@@ -54,7 +59,7 @@ TITLE_UNKNOWNS_BY_SUBJECT = True  # just give it a name based on what we see if 
 SCRUB_EMOJIS_FROM_LLM_INPUT = True  # Set to True to strip emojis before sending data to Gemini (prevents some crashes)
 SAVE_RAW_LENS_DATA = True  # Set to True to save the raw SerpApi response to a '_tmp.json' file
 REDO_LLM = False  # Set to True to re-run Gemini on files that already have a final .json metadata file
-
+PASSWORD=GORILLE
 # Globally disable safety filters for art processing
 DEFAULT_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
