@@ -222,3 +222,4 @@ __marimo__/
 # Google Cloud Credentials
 gcp-vision-key.json
 *.json
+playwright_profile/

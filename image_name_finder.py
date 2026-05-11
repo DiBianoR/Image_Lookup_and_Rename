@@ -5,10 +5,17 @@ import json
 import urllib.parse
 import re
 import time
+import random
 from pathlib import Path
 from google import genai
 from google.cloud import vision
 from dotenv import load_dotenv
+
+# Try to import playwright (fails gracefully if the user hasn't installed it yet)
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    pass
 
 # Load environment variables from the .env file
 load_dotenv()
@@ -21,6 +28,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 DIRECTORY_PATH = os.getenv("DIRECTORY_PATH")
 BASE_URL = os.getenv("BASE_URL")
 IMAGE_BACKEND = os.getenv("IMAGE_BACKEND", "serpapi").lower()
+PLAYWRIGHT_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "True").lower() in ['true', '1', 't', 'y', 'yes']
 ENABLE_PASS_2 = os.getenv("ENABLE_PASS_2", "True").lower() in ['true', '1', 't', 'y', 'yes']
 
 # Safety check for distributed use
@@ -29,19 +37,24 @@ if not GOOGLE_API_KEY or GOOGLE_API_KEY == "your_google_api_key_here":
     print("    Please open the .env file and paste your Google API key.")
     sys.exit(1)
 
-if IMAGE_BACKEND not in ["serpapi", "vision"]:
+if IMAGE_BACKEND not in ["serpapi", "vision", "playwright"]:
     print(f"[!] ERROR: Invalid IMAGE_BACKEND '{IMAGE_BACKEND}'.")
-    print("    Please open the .env file and set IMAGE_BACKEND to either 'serpapi' or 'vision'.")
+    print("    Please open the .env file and set IMAGE_BACKEND to 'serpapi', 'vision', or 'playwright'.")
     sys.exit(1)
 
 if IMAGE_BACKEND == "serpapi" and (not SERPAPI_KEY or SERPAPI_KEY == "your_serpapi_key_here"):
     print("[!] ERROR: Missing SerpApi Key.")
-    print("    Please open the .env file and paste your SerpApi key, or switch IMAGE_BACKEND to 'vision'.")
+    print("    Please open the .env file and paste your SerpApi key, or switch IMAGE_BACKEND.")
     sys.exit(1)
 
 if IMAGE_BACKEND == "vision" and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
     print("[!] ERROR: Missing Google Cloud Vision Credentials.")
     print("    Please open the .env file and configure GOOGLE_APPLICATION_CREDENTIALS.")
+    sys.exit(1)
+
+if IMAGE_BACKEND == "playwright" and "sync_playwright" not in globals():
+    print("[!] ERROR: Playwright is not installed.")
+    print("    Please run 'pip install playwright' and 'playwright install' in your terminal.")
     sys.exit(1)
 
 if not DIRECTORY_PATH or not BASE_URL or DIRECTORY_PATH == "your_image_directory_here" or BASE_URL == "your_image_directory_url_here":
@@ -134,7 +147,7 @@ GEMINI_SCHEMA = {
         },
         "subject": {
             "type": ["string", "null"],
-            "description": "Title aside, [if it was mentioned in the search results] what is this an image of? Null if it is unclear or not mentioned."
+            "description": "Title aside, [if it was mentioned in the search results] what is this an image of? Keep it brief. Null if it is unclear or not mentioned."
         }
     },
     "required": [
@@ -175,11 +188,18 @@ YEAR_FOLLOWUP_SCHEMA = {
 }
 
 
-def sanitize_filename(name: str) -> str:
-    """Removes characters that are illegal in Windows file paths, including hidden control/null bytes."""
+def sanitize_filename(name: str, max_length: int = 150) -> str:
+    """Removes characters that are illegal in Windows file paths and truncates to a safe length."""
     # \x00-\x1f catches all invisible control characters (including the null byte \x00)
     safe_name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", name)
-    return safe_name.strip()
+    safe_name = safe_name.strip()
+
+    # Enforce Windows MAX_PATH limits by truncating aggressively long LLM hallucinations
+    if len(safe_name) > max_length:
+        # Cut it down and append an ellipsis so you know it was truncated
+        safe_name = safe_name[:max_length].strip() + "..."
+
+    return safe_name
 
 
 def clean_redundant_title_text(title: str, first: str, last: str, year: int) -> str:
@@ -274,6 +294,35 @@ def scrub_lens_data(data: dict) -> bool:
     return modified
 
 
+def scrub_playwright_data(text: str) -> str:
+    """
+    Cleans raw Playwright text by removing top navigation menus, shopping bloat,
+    and privacy-leaking footers.
+    """
+    if not text:
+        return text
+
+    # 1. Chop off the privacy-leaking footer at the bottom
+    if "Footer Links" in text:
+        text = text.split("Footer Links")[0]
+
+    # 2. Chop off the top navigation menu (everything before the actual results)
+    if "AI Overview\n" in text:
+        text = "AI Overview\n" + text.split("AI Overview\n", 1)[1]
+    elif "Search Results\n" in text:
+        text = "Search Results\n" + text.split("Search Results\n", 1)[1]
+
+    # 3. Strip out the shopping bloat (Prices like $45*, "In stock", and star ratings)
+    text = re.sub(r'^\$[0-9]+\*?\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^.*In stock.*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^.*(?:[0-9]\.[0-9]).*\([0-9,]+\).*\n?', '', text, flags=re.MULTILINE)
+
+    # 4. Remove useless UI button text
+    text = re.sub(r'^(Show all|Show more|See more|Web results)\n?', '', text, flags=re.MULTILINE)
+
+    return text.strip()
+
+
 def search_google_lens(image_url: str) -> dict:
     """Calls SerpApi Google Lens endpoint with explicit configuration."""
     params = {
@@ -306,6 +355,67 @@ def search_google_vision_raw(image_url: str) -> dict:
 
     # Convert the raw protobuf response to a standard python dictionary
     return type(response).to_dict(response)
+
+
+def search_playwright_lens(image_url: str) -> dict:
+    """
+    Uses a headless Chromium browser to visit Google Lens directly and extract
+    all visible text. Implements stealth techniques and persistent cookies to bypass bot detection.
+    """
+    encoded_url = urllib.parse.quote(image_url, safe='')
+    lens_url = f"https://lens.google.com/uploadbyurl?url={encoded_url}"
+    extracted_text = ""
+
+    # Create a local folder to store cookies and trust tokens
+    user_data_dir = os.path.join(os.getcwd(), "playwright_profile")
+
+    with sync_playwright() as p:
+        # Launch a persistent context so cookies are saved between runs
+        context = p.chromium.launch_persistent_context(
+            user_data_dir,
+            headless=PLAYWRIGHT_HEADLESS,  # <-- Now controlled by your .env file
+            args=["--disable-blink-features=AutomationControlled"],
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080}
+        )
+
+        # Inject Javascript to hide the headless webdriver flags from Google
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        page = context.pages[0] if context.pages else context.new_page()
+
+        try:
+            page.goto(lens_url, wait_until="networkidle", timeout=15000)
+
+            # Check if Google threw up the reCAPTCHA wall
+            page_text = page.inner_text("body")
+            if "detect unusual traffic" in page_text.lower() or "not a robot" in page_text.lower():
+                print("\n    [!] 🚨 CAPTCHA DETECTED! 🚨")
+                print("    1. If you are in Headless mode, stop the script, set PLAYWRIGHT_HEADLESS=False, and re-run.")
+                print("    2. If you can see the browser, you have 60 seconds to click 'I am not a robot'.")
+                print("    3. Once clicked, wait for the script to resume. Google will remember your human cookie!\n")
+
+                # Gives you 60 seconds to physically click the box if headless=False
+                page.wait_for_timeout(60000)
+
+            # Add an extra hard wait to ensure the DOM is fully populated
+            page.wait_for_timeout(3000)
+            raw_text = page.inner_text("body")
+
+            # Run the custom scrubber to remove location footers and shopping bloat
+            extracted_text = scrub_playwright_data(raw_text)
+
+        except Exception as e:
+            print(f"    [!] Playwright scraping error: {e}")
+            raise
+        finally:
+            context.close()
+
+    delay = random.uniform(3.5, 8.5)
+    print(f"    [*] Playwright success. Sleeping for {delay:.1f}s to avoid rate limits...")
+    time.sleep(delay)
+
+    return {"playwright_extracted_text": extracted_text}
 
 
 def fetch_full_ai_overview(ai_overview_dict: dict, error_list: list, filename: str) -> dict:
@@ -483,13 +593,21 @@ def main():
     # --- COST ESTIMATION LOGIC ---
     COST_IMAGE_SEARCH_SERPAPI = 0.025
     COST_IMAGE_SEARCH_VISION = 0.0035
+    COST_IMAGE_SEARCH_PLAYWRIGHT = 0.0000
+
     COST_PASS1 = 0.00775  # Gemini 3.1 Flash-Lite (Thinking Level: LOW), 25000/1000
     COST_PASS2 = 0.02300  # Gemini 3 Flash (Thinking Level: HIGH), 25000/3500
     COST_FALLBACK_TOKENS = 0.0019 * 2  # Gemini 2.5 Flash-Lite
     GROUNDING_SEARCH_COST = 0.035  # after 1500 free queries/day
 
-    total_image_search_cost = active_files * (
-        COST_IMAGE_SEARCH_SERPAPI if IMAGE_BACKEND == "serpapi" else COST_IMAGE_SEARCH_VISION)
+    if IMAGE_BACKEND == "serpapi":
+        unit_search_cost = COST_IMAGE_SEARCH_SERPAPI
+    elif IMAGE_BACKEND == "vision":
+        unit_search_cost = COST_IMAGE_SEARCH_VISION
+    else:  # IMAGE_BACKEND == "playwright"
+        unit_search_cost = COST_IMAGE_SEARCH_PLAYWRIGHT
+
+    total_image_search_cost = active_files * unit_search_cost
     total_pass1_cost = active_files * COST_PASS1
     total_pass2_cost = active_files * COST_PASS2 if ENABLE_PASS_2 else 0.0
 
@@ -550,7 +668,7 @@ def main():
                 with open(raw_image_search_filepath, "r", encoding="utf-8") as f:
                     image_data = json.load(f)
 
-               # scrub, and mark as fetched
+                # scrub, and mark as fetched
                 if IMAGE_BACKEND == "serpapi":
                     # Scrub existing cache to prevent filename data leakage
                     cache_modified = scrub_lens_data(image_data)
@@ -571,8 +689,12 @@ def main():
                             with open(raw_image_search_filepath, "w", encoding="utf-8") as f:
                                 json.dump(image_data, f, indent=4)
                             print("    [*] Scrubbed original filename leak from existing local cache.")
-                else:  # IMAGE_BACKEND == "vision"
+                elif IMAGE_BACKEND == "vision":
                     print(f"[*] Found existing Vision data: {raw_image_search_filepath.name} (Skipping Search)")
+                    needs_api_fetch = False
+                    # todo: scrub and resave if necessary
+                elif IMAGE_BACKEND == "playwright":
+                    print(f"[*] Found existing Playwright data: {raw_image_search_filepath.name} (Skipping Search)")
                     needs_api_fetch = False
                     # todo: scrub and resave if necessary
 
@@ -591,11 +713,15 @@ def main():
 
                     # Intercept and fetch the full AI Overview immediately before it expires
                     if "ai_overview" in image_data:
-                        image_data["ai_overview"] = fetch_full_ai_overview(image_data["ai_overview"], run_errors, filepath.name)
+                        image_data["ai_overview"] = fetch_full_ai_overview(image_data["ai_overview"], run_errors,
+                                                                           filepath.name)
                 elif IMAGE_BACKEND == "vision":
                     print("[*] Querying Google Cloud Vision...")
                     image_data = search_google_vision_raw(public_url)
-
+                    # todo: scrub
+                elif IMAGE_BACKEND == "playwright":
+                    print("[*] Querying Google Lens locally via Playwright...")
+                    image_data = search_playwright_lens(public_url)
                     # todo: scrub
 
                 if SAVE_RAW_IMAGE_SEARCH_DATA:
@@ -603,12 +729,13 @@ def main():
                         json.dump(image_data, json_file, indent=4)
                     print(f"[*] Saved raw data to: {raw_image_search_filepath.name}")
 
-            # Assess if the AI Overview was completely empty or failed
+            # Assess if the AI Overview was completely empty or failed (Only Serpapi produces structured AI Overview chunks)
             missing_ai_overview = IMAGE_BACKEND == "serpapi" and not bool(image_data.get("ai_overview"))
 
             # 2. Pass the data to Gemini for extraction
             print("[*] Passing data to Gemini for analysis (Pass 1: flash-lite)...")
-            gemini_output = analyze_json_with_gemini(image_data, model_name="gemini-3.1-flash-lite-preview", temp=IMAGE_QUERY_TEMP)
+            gemini_output = analyze_json_with_gemini(image_data, model_name="gemini-3.1-flash-lite-preview",
+                                                     temp=IMAGE_QUERY_TEMP)
             parsed_metadata = json.loads(gemini_output)
 
             # Evaluate First Pass
@@ -619,7 +746,8 @@ def main():
             # 2b. Second Pass if Title not found AND Pass 2 is enabled
             if not title_found and ENABLE_PASS_2:
                 print("[*] Title not found definitively. Retrying (Pass 2: flash)...")
-                gemini_output_pass2 = analyze_json_with_gemini(image_data, model_name="gemini-3-flash-preview", temp=IMAGE_QUERY_TEMP)
+                gemini_output_pass2 = analyze_json_with_gemini(image_data, model_name="gemini-3-flash-preview",
+                                                               temp=IMAGE_QUERY_TEMP)
                 parsed_metadata = json.loads(gemini_output_pass2)
 
                 # Re-evaluate
